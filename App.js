@@ -1,39 +1,70 @@
 import CheckBox from '@react-native-community/checkbox';
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {View, Text, Button, Alert, StyleSheet} from 'react-native';
 import {
-  RTCPeerConnection,
-  mediaDevices,
-  registerGlobals,
-  MediaStream,
-  RTCView,
-} from 'react-native-webrtc';
-import {UserAgent, Invitation, Inviter, Registerer} from 'sip.js';
+  View,
+  Text,
+  Button,
+  Alert,
+  StyleSheet,
+  PermissionsAndroid,
+  Platform,
+} from 'react-native';
+import {mediaDevices, registerGlobals} from 'react-native-webrtc';
+import {UserAgent, Inviter, Registerer} from 'sip.js';
+import InCallManager from 'react-native-incall-manager';
 
 registerGlobals();
 
-const webSocketServer = 'wss://edge.sip.onsip.com';
-const target = 'sip:echo@sipjs.onsip.com';
+const webSocketServer = 'ws://fs.dev.ppacontatto.com.br:5066';
+const target = 'sip:joao@sipjs.onsip.com';
 const displayName = 'SIP js';
 
 const App = () => {
   const [connected, setConnected] = useState(false);
   const [callActive, setCallActive] = useState(false);
-  const [onHold, setOnHold] = useState(false);
   const [muted, setMuted] = useState(false);
-  const [remoteStream, setRemoteStream] = useState(null);
-  const userAgent = useRef(null);
+  const [speaker, setSpeaker] = useState(false);
+  const [incomingCall, setIncomingCall] = useState(false);
+  const [incomingSession, setIncomingSession] = useState(null);
+  const [localStream, setLocalStream] = useState(null);
+  const [callStatus, setCallStatus] = useState('');
   const registerer = useRef(null);
+  const userAgent = useRef(null);
   let currentSession = useRef(null);
 
   useEffect(() => {
+    const requestPermission = async () => {
+      if (Platform.OS === 'android') {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+          {
+            title: 'Microphone Permission',
+            message: 'This app needs access to your microphone to make calls.',
+            buttonNeutral: 'Ask Me Later',
+            buttonNegative: 'Cancel',
+            buttonPositive: 'OK',
+          },
+        );
+        return granted === PermissionsAndroid.RESULTS.GRANTED;
+      }
+      return true;
+    };
+
+    requestPermission().then(granted => {
+      if (granted) {
+        console.warn('Microphone permission granted');
+      } else {
+        console.warn('Microphone permission denied');
+      }
+    });
+
     const userAgentOptions = {
-      uri: UserAgent.makeURI(`sip:aline@sipjs.onsip.com`),
+      uri: UserAgent.makeURI(`sip:fernanda@fs.dev.ppacontatto.com.br`),
       transportOptions: {
         server: webSocketServer,
       },
-      authorizationUsername: 'echo',
-      authorizationPassword: '',
+      authorizationUsername: 'fernanda',
+      authorizationPassword: '1234',
       displayName: displayName,
     };
 
@@ -41,8 +72,19 @@ const App = () => {
 
     userAgent.current.delegate = {
       onInvite: invitation => {
-        currentSession.current = invitation;
-        handleIncomingCall(invitation);
+        invitation.sessionDescriptionHandlerOptions = {
+          constraints: {
+            audio: true,
+          },
+          RTCOfferOptions: {
+            offerToReceiveAudio: true,
+          },
+        };
+        console.error('Chamador:', invitation.remoteIdentity.displayName);
+
+        InCallManager.vibrate = true;
+        setIncomingCall(true);
+        setIncomingSession(invitation);
       },
     };
   }, []);
@@ -65,17 +107,76 @@ const App = () => {
   }, [userAgent, registerer]);
 
   const disconnect = () => {
+    if (currentSession.current) {
+      currentSession.current.bye().catch(error => {
+        console.error(`[${userAgent.current.id}] failed to hangup call`, error);
+        Alert.alert('Failed to hangup call', error.message);
+      });
+      InCallManager.setKeepScreenOn(false);
+      setCallActive(false);
+    }
+
     if (registerer.current) {
       registerer.current.unregister().then(() => {
         userAgent.current.stop().then(() => {
+          InCallManager.stop();
           setConnected(false);
         });
       });
     }
   };
 
+  const acceptCall = () => {
+    if (incomingSession) {
+      currentSession.current = incomingSession;
+      setupSession(currentSession.current);
+
+      setupSession(incomingSession);
+      incomingSession
+        .accept()
+        .then(() => {
+          InCallManager.start({media: 'audio'});
+          InCallManager.setForceSpeakerphoneOn(false);
+          InCallManager.setKeepScreenOn(true);
+          InCallManager.vibrate = false;
+          setCallActive(true);
+          setIncomingCall(false);
+        })
+        .catch(error => {
+          console.error('Falha ao aceitar chamada', error);
+          Alert.alert('Falha ao aceitar chamada', error.message);
+        });
+    }
+  };
+
+  const rejectCall = () => {
+    if (incomingSession) {
+      incomingSession
+        .reject()
+        .then(() => {
+          console.log('Chamada rejeitada');
+          setIncomingCall(false);
+          InCallManager.vibrate = false;
+        })
+        .catch(error => {
+          console.error('Falha ao rejeitar chamada', error);
+          Alert.alert('Falha ao rejeitar chamada', error.message);
+        });
+    }
+  };
+
   const call = () => {
-    const inviter = new Inviter(userAgent.current, UserAgent.makeURI(target));
+    const inviter = new Inviter(userAgent.current, UserAgent.makeURI(target), {
+      sessionDescriptionHandlerOptions: {
+        constraints: {
+          audio: true,
+        },
+        RTCOfferOptions: {
+          offerToReceiveAudio: true,
+        },
+      },
+    });
+
     currentSession.current = inviter;
     setupSession(inviter);
     inviter.invite().catch(error => {
@@ -90,79 +191,84 @@ const App = () => {
         console.error(`[${userAgent.current.id}] failed to hangup call`, error);
         Alert.alert('Failed to hangup call', error.message);
       });
+
+      if (localStream) {
+        localStream.getTracks().forEach(track => {
+          track.stop();
+        });
+        setLocalStream(null);
+      }
+      InCallManager.setKeepScreenOn(false);
+      InCallManager.stop();
       setCallActive(false);
     }
   };
 
-  const handleIncomingCall = invitation => {
-    setupSession(invitation);
-    invitation.accept().catch(error => {
-      console.error(`[${userAgent.current.id}] failed to accept call`, error);
-      Alert.alert('Failed to accept call', error.message);
-    });
-    setCallActive(true);
-  };
-
   const setupSession = async session => {
+    const localStream = await mediaDevices.getUserMedia({
+      audio: true,
+    });
+    setLocalStream(localStream);
+
     session.stateChange.addListener(state => {
       console.error(`[${userAgent.current.id}] state: ${state}`);
       if (state.toLowerCase() === 'established') {
-        // Get the remote stream and play it
-        // const remoteStream = new MediaStream();
-        // peerConnection.current.getReceivers().forEach(receiver => {
-        //   console.warn('[RECEIVER]', receiver);
-        //   remoteStream.addTrack(receiver.track);
-        // });
-        // setRemoteStream(remoteStream);
+        setCallStatus('Chamada estabelecida');
+        setCallActive(true);
+        setMuted(false);
       } else if (state.toLowerCase() === 'terminated') {
+        setCallStatus('Chamada encerrada');
         setCallActive(false);
-        setOnHold(false);
         setMuted(false);
         currentSession.current = null;
+        setCallStatus('');
+      } else if (state.toLowerCase() === 'establishing') {
+        setCallStatus('Chamando...');
       }
     });
-
-    session.delegate = {
-      onTrack: (track, streams) => {
-        console.log('[STREAMS ON TRACK', streams, track);
-        setRemoteStream(streams[0]);
-      },
-    };
-
-    const localStream = await mediaDevices.getUserMedia({
-      audio: true,
-      video: false,
-    });
-
-    console.error('Local Stream:', localStream);
-  };
-
-  const handleHold = async checked => {
-    if (checked) {
-      await currentSession.current.hold();
-      setOnHold(true);
-    } else {
-      await currentSession.current.unhold();
-      setOnHold(false);
-    }
   };
 
   const handleMute = checked => {
-    if (checked) {
-      // peerConnection.current
-      //   .getSenders()
-      //   .forEach(sender => (sender.track.enabled = false));
-      setMuted(true);
-    } else {
-      // peerConnection.current
-      //   .getSenders()
-      //   .forEach(sender => (sender.track.enabled = true));
-      setMuted(false);
+    const audioTracks = localStream.getAudioTracks();
+    console.log('Muting:', checked);
+    audioTracks.forEach(track => {
+      console.log('Before mute toggle:', track.enabled);
+      track.enabled = !checked;
+      console.log('After mute toggle:', track.enabled);
+    });
+    setMuted(checked);
+
+    if (currentSession.current) {
+      currentSession.current.invite();
+      console.log('Renegotiation triggered');
     }
   };
-  console.warn(remoteStream);
+
+  const handleSpeaker = async checked => {
+    console.log('Speaker toggled:', checked);
+    setSpeaker(checked);
+    try {
+      if (checked) {
+        InCallManager.setForceSpeakerphoneOn(true);
+        console.log('Speaker is on');
+      } else {
+        InCallManager.setForceSpeakerphoneOn(false);
+        console.log('Speaker is off');
+      }
+    } catch (error) {
+      console.error('Error toggling speaker:', error);
+    }
+  };
+
   return (
     <View style={styles.container}>
+      {incomingCall && (
+        <View>
+          <Button title="Aceitar" onPress={acceptCall} />
+          <Button title="Recusar" onPress={rejectCall} />
+        </View>
+      )}
+      {callStatus && <Text>{callStatus}</Text>}
       <Text>WebSocket Server: {webSocketServer}</Text>
       <Text>Target: {target}</Text>
       <Button title="Connect" onPress={connect} disabled={connected} />
@@ -170,19 +276,17 @@ const App = () => {
       <Button title="Hangup" onPress={hangup} disabled={!callActive} />
       <Button title="Disconnect" onPress={disconnect} disabled={!connected} />
       <CheckBox
-        value={onHold}
-        onValueChange={handleHold}
-        disabled={!callActive}
-      />
-      <Text>Hold</Text>
-      <CheckBox
         value={muted}
         onValueChange={handleMute}
         disabled={!callActive}
       />
       <Text>Mute</Text>
-      {/* Element to handle audio stream */}
-      {remoteStream && <RTCView streamURL={remoteStream.toURL()} />}
+      <CheckBox
+        value={speaker}
+        onValueChange={handleSpeaker}
+        disabled={!callActive}
+      />
+      <Text>Speaker</Text>
     </View>
   );
 };
